@@ -15,7 +15,9 @@ let userProfile = null;
 let currentZonaId = null;
 let currentCajonId = null;
 let countdownTimer = null;
-let zonaUnsubscribe = null;   // Firestore real-time listener unsubscriber
+let zonaUnsubscribe = null;
+let yaDetectadoOcupado = false;
+let yaDetectadoLibre = false;// Firestore real-time listener unsubscriber
 
 // Zone pin positions (% on map image)
 const PIN_POSITIONS = {
@@ -206,6 +208,7 @@ window.showZona = function (idZona) {
 function renderZona(zona) {
   const titulo = document.getElementById('titulo-zona');
   const contenedor = document.getElementById('grid-dinamico');
+
   if (titulo) titulo.textContent = zona.nombre;
 
   const cajones = zona.cajonesList || [];
@@ -229,7 +232,11 @@ function renderZona(zona) {
 
   cajones.forEach(cajon => {
     const { id: idCajon, estado, reservadoPor } = cajon;
-    const esMio = reservadoPor === currentUser?.uid;
+    const esMio =
+      reservadoPor === currentUser?.uid ||
+      (userProfile?.reservaActiva &&
+        userProfile.reservaActiva.zonaId === currentZonaId &&
+        userProfile.reservaActiva.cajonId === idCajon);
     const esOcupado = estado !== 'libre';
     const div = document.createElement('div');
 
@@ -251,6 +258,28 @@ function renderZona(zona) {
           // Show active QR again
           mostrarQRActivo();
         } else {
+          // ====== VALIDACIÓN DE TIPO DE VEHÍCULO ======
+          const vehiculoUsuario = userProfile?.vehiculo || 'coche';
+          const esCajonMoto = motos.includes(idCajon);
+          const esCajonBici = bicicletas.includes(idCajon);
+          const esCajonDiscap = discap.includes(idCajon);
+          const esCajonNormal = !esCajonMoto && !esCajonBici && !esCajonDiscap;
+
+          // 1. Si es cajón de Moto y el usuario no tiene Moto
+          if (esCajonMoto && vehiculoUsuario !== 'moto') {
+            mostrarNotificacion(t('notif_moto_only'));
+            return;
+          }
+          // 2. Si es cajón de Bici y el usuario no tiene Bici
+          if (esCajonBici && vehiculoUsuario !== 'bicicleta') {
+            mostrarNotificacion(t('notif_bike_only'));
+            return;
+          }
+          // 3. Si es cajón Normal y el usuario no tiene Coche
+          if (esCajonNormal && vehiculoUsuario !== 'coche') {
+            mostrarNotificacion(t('notif_car_only'));
+            return;
+          }
           // Check: does user have a discapacidad mismatch?
           if (discap.includes(idCajon) && !userProfile?.discapacidad) {
             mostrarNotificacion(t('notif_disabled_only'));
@@ -270,7 +299,152 @@ function renderZona(zona) {
     pin.className = `pin selected ${libres === 0 ? 'full' : 'available'}`;
     pin.innerHTML = `<span>${currentZonaId}</span><span class="pin-label">${libres}/${cajones.length}</span>`;
   }
+  const cajonActual = cajones.find(c => c.id === currentCajonId);
+  if (!cajonActual) return;
+
+  // 🔴 DETECTAR SI MI CAJÓN CAMBIÓ A OCUPADO
+  if (userProfile?.reservaActiva && currentCajonId) {
+    const cajonActual = cajones.find(c => c.id === currentCajonId);
+
+    if (cajonActual && cajonActual.estado === 'ocupado' && !yaDetectadoOcupado) {
+      yaDetectadoOcupado = true;
+      finalizarPorOcupacion();
+    }
+  }
+  if (
+    cajonActual.estado === 'ocupado' &&
+    !yaDetectadoOcupado &&
+    userProfile?.reservaActiva?.estado === 'activa'
+  ) {
+    yaDetectadoOcupado = true;
+    finalizarPorOcupacion();
+  }
+
+
+  // 🟢 DETECTAR SI MI CAJÓN FUE LIBERADO
+  if (userProfile?.reservaActiva && currentCajonId) {
+    const cajonActual = cajones.find(c => c.id === currentCajonId);
+
+    if (cajonActual && cajonActual.estado === 'libre' && !yaDetectadoLibre) {
+      yaDetectadoLibre = true;
+      finalizarPorLiberacion();
+    }
+  }
+  if (
+    cajonActual.estado === 'libre' &&
+    !yaDetectadoLibre &&
+    userProfile?.reservaActiva?.estado === 'ocupando'
+  ) {
+    yaDetectadoLibre = true;
+    finalizarPorLiberacion();
+  }
 }
+
+async function finalizarPorOcupacion() {
+  try {
+    // Evitar múltiples ejecuciones
+    if (!userProfile?.reservaActiva) return;
+
+    console.log('🚗 Cajón ocupado, finalizando reservación...');
+
+    // 🔴 Detener timer
+    clearInterval(countdownTimer);
+
+    // 🔴 Actualizar reservación en Firebase
+    if (userProfile.reservaActiva.resId) {
+      await updateDoc(doc(db, 'reservaciones', userProfile.reservaActiva.resId), {
+        estado: 'finalizada',
+        finalizadoEn: new Date().toISOString(),
+        motivo: 'ocupado'
+      });
+    }
+
+    // 🔴 Limpiar reserva activa del usuario (PERO NO TOCAR EL CAJÓN)
+    await updateDoc(doc(db, 'usuarios', currentUser.uid), {
+      reservaActiva: {
+        ...userProfile.reservaActiva,
+        estado: 'ocupando'
+      }
+    });
+
+    userProfile.reservaActiva.estado = 'ocupando';
+
+    // 🔴 Mantener QR visible (NO cerrar modal)
+    mostrarNotificacion('✅ Cajón ocupado. Reservación finalizada.');
+
+    // Opcional: quitar badge
+    ocultarBadgeActivo();
+
+  } catch (err) {
+    console.error('Error finalizando por ocupación:', err);
+  }
+}
+
+async function finalizarPorLiberacion() {
+  try {
+    if (!userProfile?.reservaActiva) return;
+    const zonaRef = doc(db, 'estacionamientos', currentZonaId);
+    const zonaSnap = await getDoc(zonaRef);
+    const estado = userProfile.reservaActiva.estado;
+
+    // 🔴 SOLO si estaba ocupando
+    if (estado !== 'ocupando') return;
+
+    console.log('🟢 Cajón liberado correctamente');
+
+    clearInterval(countdownTimer);
+
+    // 🔴 Actualizar reservación en Firestore
+    if (userProfile.reservaActiva?.resId) {
+      await updateDoc(doc(db, 'reservaciones', userProfile.reservaActiva.resId), {
+        estado: 'finalizada',
+        finalizadoEn: new Date().toISOString(),
+        motivo: 'liberado'
+      });
+    }
+
+    // 🔴 LIMPIAR usuario (CLAVE)
+    await updateDoc(doc(db, 'usuarios', currentUser.uid), {
+      reservaActiva: null
+    });
+    if (zonaSnap.exists()) {
+      const cajones = zonaSnap.data().cajonesList || [];
+
+      const nuevaLista = cajones.map(c =>
+        c.id === currentCajonId
+          ? {
+            ...c,
+            estado: 'libre',
+            reservadoPor: null,
+            reservadoEn: null,
+            expiraEn: null
+          }
+          : c
+      );
+
+      await updateDoc(zonaRef, { cajonesList: nuevaLista });
+    }
+
+    userProfile.reservaActiva = null;
+
+    // 🔴 RESET FLAGS (MUY IMPORTANTE)
+    yaDetectadoOcupado = false;
+    yaDetectadoLibre = false;
+
+    ocultarBadgeActivo();
+    mostrarNotificacion('🅿️ Lugar liberado, puedes reservar de nuevo');
+
+  } catch (err) {
+    console.error(err);
+  }
+  if (currentZonaId) {
+    const snap = await getDoc(doc(db, 'estacionamientos', currentZonaId));
+    if (snap.exists()) renderZona(snap.data());
+  }
+
+
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // OPEN MODAL
@@ -278,8 +452,17 @@ function renderZona(zona) {
 function abrirModal(idZona, idCajon, nombreZona, discap, motos, bicicletas) {
   // If user already has an active reservation
   if (userProfile?.reservaActiva) {
-    mostrarNotificacion(t('notif_already_res'));
-    return;
+    const estado = userProfile.reservaActiva.estado;
+
+    if (estado === 'ocupando') {
+      mostrarNotificacion('🚗 Ya estás ocupando un cajón');
+      return;
+    }
+
+    if (estado === 'activa') {
+      mostrarNotificacion(t('notif_already_res'));
+      return;
+    }
   }
 
   currentCajonId = idCajon;
@@ -303,7 +486,8 @@ function abrirModal(idZona, idCajon, nombreZona, discap, motos, bicicletas) {
 window.confirmarReserva = async function () {
   const btn = document.getElementById('confirm-btn');
   const zonaNombre = document.getElementById('modal-zona-nombre').textContent;
-
+  yaDetectadoOcupado = false;
+  yaDetectadoLibre = false;
   btn.innerHTML = '<span class="btn-spinner"></span>Reservando...';
   btn.disabled = true;
 
@@ -369,6 +553,9 @@ window.confirmarReserva = async function () {
 
   btn.textContent = t('btn_confirm');
   btn.disabled = false;
+  // Mostrar botón cancelar (porque aún no ocupa)
+  const btnCancel = document.querySelector('#vista-qr .danger-btn');
+  if (btnCancel) btnCancel.style.display = 'block';
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -488,12 +675,23 @@ window.mostrarQRActivo = function () {
   document.getElementById('vista-confirmacion').style.display = 'none';
   document.getElementById('vista-qr').style.display = 'block';
   document.getElementById('modal-seleccion').style.display = 'flex';
+  const btnCancel = document.querySelector('#vista-qr .danger-btn');
+
+  if (btnCancel && userProfile?.reservaActiva?.estado === 'ocupando') {
+    btnCancel.style.display = 'none';
+  } else if (btnCancel) {
+    btnCancel.style.display = 'block';
+  }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LIBERAR LUGAR
 // ═══════════════════════════════════════════════════════════════════════════
 async function liberarLugar(zonaId, cajonId, esAutomatico = false) {
+  clearInterval(countdownTimer);
+
+  yaDetectadoOcupado = false;
+  yaDetectadoLibre = false;
   try {
     // Update zone spot
     const zonaRef = doc(db, 'estacionamientos', zonaId);
@@ -501,8 +699,14 @@ async function liberarLugar(zonaId, cajonId, esAutomatico = false) {
     if (zonaSnap.exists()) {
       const cajones = zonaSnap.data().cajonesList || [];
       const nuevaLista = cajones.map(c =>
-        c.id === cajonId
-          ? { id: c.id, estado: 'libre', reservadoPor: null, reservadoEn: null, expiraEn: null }
+        c.id === currentCajonId
+          ? {
+            ...c,
+            estado: 'libre',
+            reservadoPor: null,
+            reservadoEn: null,
+            expiraEn: null
+          }
           : c
       );
       await updateDoc(zonaRef, { cajonesList: nuevaLista });
@@ -538,6 +742,18 @@ window.cancelarReservacionActual = async function () {
   if (!confirm(t('confirm_cancel_res'))) return;
 
   await liberarLugar(currentZonaId, currentCajonId, false);
+
+  // 🔴 LIMPIAR estado local
+  currentCajonId = null;
+
+  // 🔴 FORZAR RE-RENDER inmediato
+  if (currentZonaId) {
+    const snap = await getDoc(doc(db, 'estacionamientos', currentZonaId));
+    if (snap.exists()) {
+      renderZona(snap.data());
+    }
+  }
+
   mostrarNotificacion(t('notif_cancelled'));
   cerrarModal();
 };
